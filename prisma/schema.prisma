@@ -1,6 +1,54 @@
-// Prisma + Turso (libSQL) — ver adr-sublistudio.md DEC-01 y DEC-02
-// El modelado de entidades (User, Role, Subscription, etc.) se hace en Fase 1.
-// Este schema es el mínimo funcional para validar la conexión en Fase 0.
+// Prisma + Turso (libSQL) — ver adr-sublistudio.md DEC-01, DEC-02, DEC-05, DEC-06
+//
+// ─────────────────────────────────────────────────────────────
+// CONVENCIÓN DE NOMBRES (DEC-06 — aplica ../documentacion-sublistudio/technical-docs/Estandar_desarrrollo_bases_datos.md)
+// ─────────────────────────────────────────────────────────────
+// El estándar interno permite español o inglés para negocio ("Coherencia con el dominio") —
+// este proyecto usa **inglés en ambas capas**, decisión explícita del equipo.
+//   - Lado Prisma/TypeScript (izquierda de cada campo): camelCase (`user.passwordHash`).
+//   - Lado base de datos real (dentro de @map/@@map): snake_case (`password_hash`).
+// La convención `snake_case` del estándar es independiente del idioma — sigue exigiendo el
+// mapeo camelCase → snake_case aunque ambas capas compartan idioma, por eso @map/@@map se
+// mantienen en todo el schema.
+//
+// Timestamps: se unifica TODA fecha/hora (de negocio o de auditoría) con sufijo `_at`
+// (`last_login_at`, `otp_expires_at`, `started_at`, `created_at`...). El estándar distinguía
+// prefijo `fecha_` (negocio, pensado para español) vs. sufijo `_at` (auditoría, inglés) porque
+// asumía idiomas distintos por tipo de campo; al ir todo en inglés, esa distinción se vuelve
+// redundante — se adopta el patrón `_at` de forma uniforme, coherente con la convención inglesa
+// estándar (Rails/TypeORM/Prisma) y con la propia regla de auditoría del estándar.
+//
+// Desviaciones documentadas respecto al estándar (con justificación):
+// 1. Moneda: el estándar recomienda evitar punto flotante y usar DECIMAL/NUMERIC (ya no es
+//    prohibición absoluta, pero sigue siendo la recomendación). SQLite/Turso no tiene un tipo
+//    decimal de precisión fija (solo NULL/INTEGER/REAL/TEXT/BLOB). Se mantiene el patrón estándar
+//    de la industria (ej. Stripe): guardar el monto como entero en la unidad mínima de la moneda
+//    (centavos) — evita errores de redondeo de punto flotante sin depender de un tipo inexistente
+//    en el motor, incluso ahora que la regla es una recomendación y no una prohibición.
+// 2. "Campo descriptivo tras la PK nombrado como la tabla (singular)": aplicado literalmente en
+//    catálogos simples (roles→role, categories→category, plans→plan). NO aplicado en entidades
+//    complejas (users, resources) donde forzarlo produce nombres sin sentido (`user.user`).
+//    Se usa en su lugar el campo más identificador (email, title).
+// 3. AuditLog (audit_logs) no tiene `updated_at`: es un log de solo-inserción, inmutable por
+//    diseño. Agregar `updated_at` implicaría que las filas pueden modificarse, lo cual rompería
+//    su propósito de auditoría. Excepción justificada, análoga a las que el propio estándar
+//    permite para ON DELETE/UPDATE CASCADE en "casos justificados".
+// 4. Nombrado de constraints (pk_/fk_ del estándar, sección 4): SQLite no expone constraints de
+//    PK/FK con nombre propio en su catálogo (a diferencia de Postgres/SQL Server), así que esa
+//    convención no aplica literalmente aquí. Sí se nombran los índices (`idx_`/`uq_`) vía `map:`,
+//    que Turso/SQLite sí soporta y que se preserva si el proyecto migra a Postgres (ver DEC-02).
+//
+// Otras notas técnicas:
+// - SQLite/Turso no soporta `enum` nativo de Prisma. Los campos que en otro motor serían enum
+//   aquí son String; los valores permitidos están documentados junto a cada campo y deben
+//   validarse en los DTOs (class-validator) en NestJS, no solo confiar en el schema.
+// - IDs: Int autoincrement. Eficiente para joins/índices — relevante porque Turso cuenta filas
+//   escaneadas contra la cuota del free tier (ver DEC-02).
+// - Búsqueda de texto (Fase 4): SQLite FTS5 no se modela como `model` de Prisma. Se crea con una
+//   migración SQL manual (`prisma migrate dev --create-only` + SQL a mano).
+// - Toda tabla obligatoriamente tiene id + created_at + updated_at (deleted_at opcional), por
+//   requisito del estándar §2. Las tablas pivote tienen su propio `id` (no PK compuesta), también
+//   por requisito del estándar §2/§3.2.
 
 generator client {
   provider        = "prisma-client-js"
@@ -12,8 +60,365 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Modelo de prueba — eliminar al iniciar Fase 1 (esquema real de dominio)
-model HealthCheck {
-  id        Int      @id @default(autoincrement())
-  createdAt DateTime @default(now())
+// ─────────────────────────────────────────────────────────────
+// Usuarios y roles
+// ─────────────────────────────────────────────────────────────
+
+// 4 roles fijos del negocio: SUPERADMIN, ADMINISTRADOR, CLIENTE, USUARIO.
+// Se modela como tabla (no enum) para permitir futura extensión sin migrar datos existentes.
+// Regla de negocio "el Superadmin no se puede eliminar" se enforced en la capa de servicio
+// (guard en el caso de uso de delete), no a nivel de BD.
+model Role {
+  id Int @id @default(autoincrement())
+
+  name String @map("role") // campo descriptivo principal, nombrado como la tabla (singular) — regla del estándar
+  slug String @unique @map("code_role") // "SUPERADMIN" | "ADMINISTRADOR" | "CLIENTE" | "USUARIO"
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  users User[]
+
+  @@map("roles")
+}
+
+// Seguridad de autenticación (DEC-05): soporta login tradicional (email+clave) y OAuth2 con
+// UN proveedor activo a la vez (inicialmente Google, extensible a otros sin migrar el schema).
+// Regla de privacidad: ante credenciales inválidas, cuenta inexistente, o cuenta solo-OAuth
+// (passwordHash NULL), el backend SIEMPRE responde el mismo mensaje genérico de error — nunca
+// debe ser posible inferir desde la respuesta si un email existe o qué método de auth usa
+// (previene User Enumeration). Ver TASKS.md Fase 1 para los criterios de aceptación exactos.
+model User {
+  id Int @id @default(autoincrement())
+
+  email        String  @unique @map("email")
+  passwordHash String? @map("password_hash") // NULL si el usuario solo usa OAuth2
+
+  // auth_method: "local" | "google" | "both" — decide qué plantilla de correo dispara el flujo
+  // de "olvidé mi contraseña" (ver TASKS.md). Se mantiene sincronizado por la capa de servicio
+  // cada vez que el usuario setea clave o vincula/desvincula OAuth — no es un campo derivado en BD.
+  authMethod String @default("local") @map("auth_method")
+
+  // Datos del proveedor OAuth2 activo. Ambos NULL si el usuario es 100% local.
+  // provider: "google" (valor único soportado inicialmente; extensible a futuro sin migrar schema)
+  provider   String? @map("provider")
+  providerId String? @map("provider_code") // ID único que entrega el proveedor (ej. Google "sub")
+
+  firstName String  @map("first_name")
+  lastName  String  @map("last_name")
+  // full_name: concatenación automática (firstName + " " + lastName), calculada por la capa de
+  // aplicación en cada create/update — no es una columna generada por SQLite (evita depender de
+  // GENERATED ALWAYS AS, que requeriría migración SQL manual fuera de Prisma).
+  fullName  String  @map("full_name")
+  avatarUrl String? @map("avatar_url") // URL de foto de perfil (autocompletada desde Google en login OAuth)
+
+  phone    String? @map("phone") // teléfono general/alterno
+  whatsapp String? @map("whatsapp") // canal de contacto principal — capturado obligatorio en checkout (Fase 7)
+  telegram String? @map("telegram") // handle para verificación manual de acceso a comunidad privada (Fase 5)
+
+  // Token de notificaciones push. NOTA: un solo campo = un solo dispositivo activo por usuario.
+  // Fuera del alcance del documento de requerimientos original — confirmar si se necesita ya
+  // o es para una fase futura; si se requiere multi-dispositivo, migrar a tabla `UserPushToken`.
+  pnsToken String? @map("push_notification_token")
+
+  country String? @map("country")
+  city    String? @map("city")
+  address String? @map("address")
+
+  roleId Int
+  role   Role @relation(fields: [roleId], references: [id])
+
+  // is_blocked: revocación temporal de acceso (disputas, cancelaciones) — la cuenta sigue existiendo.
+  // deletedAt: baja definitiva (soft delete) — distinto de isBlocked, ver nota de soft delete abajo.
+  isBlocked   Boolean   @default(false) @map("is_blocked")
+  lastLoginAt DateTime? @map("last_login_at")
+
+  // Verificación de email — se autocompleta al registrarse vía OAuth (Google ya lo verificó).
+  emailVerifiedAt DateTime? @map("email_verified_at")
+
+  // Email OTP (Fase 1)
+  otpCode       String?   @map("otp_code")
+  otpExpiresAt  DateTime? @map("otp_expires_at")
+  otpVerifiedAt DateTime? @map("otp_verified_at")
+
+  // Recuperación de contraseña: se guarda el HASH del token (nunca el token en texto plano —
+  // mismo criterio que la contraseña, por si la BD se filtra) y su expiración explícita.
+  // Ver flujo completo de bifurcación local/OAuth en TASKS.md Fase 1.
+  resetPasswordTokenHash      String?   @map("reset_password_token_hash")
+  resetPasswordTokenExpiresAt DateTime? @map("reset_password_token_expires_at")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at") // soft delete — baja definitiva, distinto de is_blocked
+
+  subscriptions     Subscription[]
+  uploadedResources Resource[]     @relation("ResourceUploadedBy")
+  tickets           Ticket[]       @relation("TicketCreatedBy")
+  auditLogs         AuditLog[]
+
+  @@unique([provider, providerId], map: "uq_users_provider_provider_code")
+  @@index([roleId], map: "idx_users_role_id") // índice: guards filtran por rol constantemente
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Planes y suscripciones
+// ─────────────────────────────────────────────────────────────
+
+model Plan {
+  id Int @id @default(autoincrement())
+
+  name        String  @map("plan") // campo descriptivo principal, nombrado como la tabla (singular)
+  description String? @map("description")
+
+  // billing_interval: "MENSUAL" | "ANUAL"
+  billingInterval String @default("MENSUAL") @map("billing_interval")
+
+  // Monto en la unidad mínima de la moneda (centavos) — se evita punto flotante para dinero.
+  // Ver nota de "Moneda" al inicio del archivo (SQLite no tiene tipo DECIMAL).
+  priceCents Int    @map("price_cents")
+  currency   String @default("USD") @map("currency")
+
+  isActive Boolean @default(true) @map("is_active")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at") // soft delete — un plan referenciado por suscripciones históricas no debe borrarse físicamente
+
+  subscriptions Subscription[]
+
+  @@map("plans")
+}
+
+model Subscription {
+  id Int @id @default(autoincrement())
+
+  userId Int  @map("user_id")
+  user   User @relation(fields: [userId], references: [id])
+
+  planId Int  @map("plan_id")
+  plan   Plan @relation(fields: [planId], references: [id])
+
+  // status: "ACTIVA" | "CANCELADA" | "VENCIDA"
+  status String @default("ACTIVA") @map("status")
+
+  startedAt   DateTime  @default(now()) @map("started_at")
+  renewsAt    DateTime? @map("renews_at")
+  cancelledAt DateTime? @map("cancelled_at")
+
+  // Referencia al pago/suscripción en la pasarela externa (Fase 8, pasarela por definir)
+  paymentGatewayRef String? @map("payment_gateway_ref")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([userId], map: "idx_subscriptions_user_id")
+  @@index([status], map: "idx_subscriptions_status") // índice: guard de suscripción activa consulta esto en cada descarga
+  @@map("subscriptions")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Recursos (imagen + comprimido opcional + thumbnails) y categorías
+// ─────────────────────────────────────────────────────────────
+
+model Category {
+  id Int @id @default(autoincrement())
+
+  name String @unique @map("category") // campo descriptivo principal, nombrado como la tabla (singular)
+  slug String @unique @map("category_code")
+
+  resources ResourceCategory[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at") // soft delete — evita romper el historial de recursos ya categorizados
+
+  @@map("categories")
+}
+
+// Un recurso siempre tiene una imagen de preview (lo que se muestra en catálogo/landing).
+// Opcionalmente tiene un comprimido con los archivos reales de impresión (distintos formatos
+// de esa misma imagen). Peor caso: solo existe la imagen, sin comprimido — visibility=FREE
+// suele darse en ese caso.
+model Resource {
+  id Int @id @default(autoincrement())
+
+  // "title" (no "resource") — forzar el nombre de tabla aquí sería confuso; ver nota de
+  // desviaciones al inicio del archivo.
+  title       String  @map("title")
+  description String? @map("description")
+
+  // Imagen de preview — obligatoria. Es lo único garantizado que existe siempre.
+  previewImageKey       String @map("preview_image_key")
+  previewImageSizeBytes Int    @map("preview_image_size_bytes")
+  previewImageMimeType  String @map("preview_image_mime_type") // "image/png" | "image/jpeg" | "image/webp" ...
+
+  // Comprimido con los archivos de impresión — opcional (puede no existir).
+  // compressed_file_type: "ZIP" | "RAR" | "TAR"
+  // El peso máximo (variable global, Fase 1) se valida principalmente contra
+  // compressedFileSizeBytes, que es el archivo pesado; previewImageSizeBytes normalmente ya es liviano.
+  compressedFileKey       String? @map("compressed_file_key")
+  compressedFileSizeBytes Int?    @map("compressed_file_size_bytes")
+  compressedFileType      String? @map("compressed_file_type")
+
+  // Thumbnails: generados de forma asíncrona tras la carga (background job), a partir de previewImageKey.
+  // null mientras el job no ha corrido o falló — evita servir la imagen pesada en el catálogo.
+  thumbnailsGeneratedAt DateTime?           @map("thumbnails_generated_at")
+  thumbnails            ResourceThumbnail[]
+
+  // visibility: "FREE" | "PREMIUM" — controla qué se muestra en la landing pública (Fase 5)
+  visibility String @default("PREMIUM") @map("visibility")
+
+  uploadedById Int  @map("uploaded_by_id")
+  uploadedBy   User @relation("ResourceUploadedBy", fields: [uploadedById], references: [id])
+
+  categories ResourceCategory[]
+  tickets    Ticket[]           @relation("TicketAboutResource")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at") // soft delete — el requerimiento pide conservar fecha de eliminación
+
+  @@index([visibility], map: "idx_resources_visibility") // índice: landing pública y catálogo filtran por free/premium
+  @@index([uploadedById], map: "idx_resources_uploaded_by_id")
+  @@map("resources")
+}
+
+// Tamaños generados por convención de negocio/código (ej. SMALL=300px, MEDIUM=800px).
+// Se modela aparte (no como columnas fijas en Resource) para poder agregar un tamaño nuevo
+// sin migrar el schema, y para trackear si la generación async falló o sigue pendiente
+// (ausencia de fila = no generado todavía).
+model ResourceThumbnail {
+  id Int @id @default(autoincrement())
+
+  resourceId Int      @map("resource_id")
+  resource   Resource @relation(fields: [resourceId], references: [id])
+
+  size       String @map("size") // "SMALL" | "MEDIUM" (agregar más valores si se necesita, sin migrar schema)
+  storageKey String @map("storage_key")
+  width      Int?   @map("width_px")
+  height     Int?   @map("height_px")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([resourceId, size], map: "uq_resource_thumbnails_resource_id_size")
+  @@index([resourceId], map: "idx_resource_thumbnails_resource_id")
+  @@map("resource_thumbnails")
+}
+
+// Tabla pivote N:M explícita. Nombre en BD ordenado alfabéticamente por tabla ("categories" antes
+// que "resources"), según el estándar. Tiene su propio `id` (no PK compuesta) — requisito explícito
+// del estándar §2/§3.2 para tablas pivote, más los índices en ambas FK y el unique que reemplaza
+// la antigua PK compuesta para seguir evitando duplicados.
+model ResourceCategory {
+  id Int @id @default(autoincrement())
+
+  resourceId Int      @map("resource_id")
+  resource   Resource @relation(fields: [resourceId], references: [id])
+
+  categoryId Int      @map("category_id")
+  category   Category @relation(fields: [categoryId], references: [id])
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([resourceId, categoryId], map: "uq_categories_resources_resource_id_category_id")
+  @@index([categoryId], map: "idx_categories_resources_category_id") // índice: catálogo filtra por categoría
+  @@index([resourceId], map: "idx_categories_resources_resource_id")
+  @@map("categories_resources")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tickets / mensajes
+// ─────────────────────────────────────────────────────────────
+
+model Ticket {
+  id Int @id @default(autoincrement())
+
+  // type: "GENERAL" | "RECURSO"
+  type String @map("type")
+
+  subject String @map("subject")
+  message String @map("message")
+
+  // priority: "BAJA" | "MEDIA" | "ALTA" | "URGENTE"
+  priority String @default("MEDIA") @map("priority")
+
+  // status: "ABIERTO" | "EN_PROCESO" | "CERRADO"
+  status String @default("ABIERTO") @map("status")
+
+  createdById Int  @map("created_by_id")
+  createdBy   User @relation("TicketCreatedBy", fields: [createdById], references: [id])
+
+  // Solo aplica si type = "RECURSO"
+  resourceId Int?      @map("resource_id")
+  resource   Resource? @relation("TicketAboutResource", fields: [resourceId], references: [id])
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([priority, status], map: "idx_tickets_priority_status") // índice: vista admin ordena por prioridad
+  @@index([createdById], map: "idx_tickets_created_by_id")
+  @@map("tickets")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Auditoría (transversal — ver DEC-01: misma transacción que la acción auditada)
+// ─────────────────────────────────────────────────────────────
+
+// Sin `updated_at`: log de solo-inserción, inmutable por diseño (ver nota de desviaciones
+// al inicio del archivo). Nunca se actualiza ni se borra una fila de auditoría.
+model AuditLog {
+  id Int @id @default(autoincrement())
+
+  // Módulo que originó la acción (ej. "users", "resources", "payments") — requisito explícito del negocio
+  module String @map("module")
+
+  // action: "CREATE" | "UPDATE" | "DELETE" | "PAY" | "UPLOAD" (u otro string libre si se necesita)
+  action String @map("action")
+
+  entityType String @map("entity_type") // ej. "User", "Resource", "Subscription"
+  entityId   Int?   @map("entity_id")
+
+  userId Int?  @map("user_id")
+  user   User? @relation(fields: [userId], references: [id])
+
+  // Payload variable de la acción (antes/después, metadata) — estructura libre
+  payload Json? @map("payload")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([module], map: "idx_audit_logs_module")
+  @@index([entityType, entityId], map: "idx_audit_logs_entity_type_entity_id")
+  @@index([createdAt], map: "idx_audit_logs_created_at") // índice: soporta el job de rotación/archivado (Fase 9)
+  @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Variables globales
+// ─────────────────────────────────────────────────────────────
+
+model GlobalVariable {
+  id  Int    @id @default(autoincrement())
+  key String @unique @map("key")
+
+  // Módulo dueño de la variable, o null si es verdaderamente global
+  scope String? @map("scope")
+
+  // value_type: "SCALAR" | "JSON" — determina cómo la interfaz de lectura/escritura interpreta `value`
+  valueType String @map("value_type")
+
+  // Almacena tanto escalares (envueltos, ej. {"value": 50}) como estructuras complejas.
+  // Consultado con json_extract() cuando se necesita filtrar/indexar por una clave interna (ver DEC-02).
+  value Json @map("value")
+
+  description String? @map("description")
+
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([scope], map: "idx_global_variables_scope")
+  @@map("global_variables")
 }
