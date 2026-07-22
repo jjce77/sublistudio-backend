@@ -1,0 +1,19 @@
+// Prisma + Turso (libSQL) — ver adr-sublistudio.md DEC-01 y DEC-02
+// El modelado de entidades (User, Role, Subscription, etc.) se hace en Fase 1.
+// Este schema es el mínimo funcional para validar la conexión en Fase 0.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Modelo de prueba — eliminar al iniciar Fase 1 (esquema real de dominio)
+model HealthCheck {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+}
