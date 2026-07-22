@@ -44,4 +44,6 @@ prisma/*.db-journal
 # Storage local (Fase 0 — archivos subidos en desarrollo)
 storage/
 !storage/.gitkeep
->>>>>>> 010525e (Initial commit)
+
+# symlink a ../documentacion-sublistudio (repo separado, no se versiona).
+docs/
