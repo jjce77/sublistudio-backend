@@ -1,0 +1,17 @@
+node_modules
+dist
+build
+coverage
+storage
+docs
+.git
+.github
+.vscode
+.idea
+*.log
+npm-debug.log*
+.env
+.env.local
+.env.*.local
+prisma/dev.db
+prisma/*.db-journal
