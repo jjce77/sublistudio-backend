@@ -3,20 +3,27 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaLibSQL } from '@prisma/adapter-libsql';
 import { PrismaClient } from '@prisma/client';
 
-// Driver adapter libSQL (patrón Prisma 6.6+, ver TASKS.md Fase 0 y adr-sublistudio.md DEC-02).
-// El authToken se pasa aquí, nunca embebido en una URL tipo `libsql://user:token@host`.
+// Motor elegido vía DB_PROVIDER (.env). "turso-sqlite" usa el adapter PrismaLibSQL (Turso no
+// soporta `libsql://` nativo); el resto usa el motor nativo de Prisma con DATABASE_URL.
 @Injectable()
 export class PrismaService
   extends PrismaClient
   implements OnModuleInit, OnModuleDestroy
 {
   constructor(configService: ConfigService) {
-    const adapter = new PrismaLibSQL({
-      url: configService.get<string>('turso.databaseUrl')!,
-      authToken: configService.get<string>('turso.authToken'),
-    });
+    const isTursoSqlite =
+      configService.get<string>('database.provider') === 'turso-sqlite';
 
-    super({ adapter });
+    super(
+      isTursoSqlite
+        ? {
+            adapter: new PrismaLibSQL({
+              url: configService.get<string>('turso.databaseUrl')!,
+              authToken: configService.get<string>('turso.authToken'),
+            }),
+          }
+        : {},
+    );
   }
 
   async onModuleInit() {

@@ -54,13 +54,9 @@ generator client {
   provider = "prisma-client-js"
 }
 
-// DATABASE_URL es un placeholder local (`file:./prisma/dev.db`) — Prisma exige formato nativo
-// `file:` para el datasource del provider "sqlite" al validar el schema, aunque este valor
-// nunca se usa para conectar de verdad. La conexión real a Turso pasa por el adapter
-// PrismaLibSQL (TURSO_DATABASE_URL/TURSO_AUTH_TOKEN), registrado en prisma.config.ts (CLI)
-// y src/prisma/prisma.service.ts (runtime). Ver adr-sublistudio.md DEC-02.
+// `provider` se sincroniza con DB_PROVIDER vía `npm run db:prepare` (ver prisma.config.ts).
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
   url      = env("DATABASE_URL")
 }
 

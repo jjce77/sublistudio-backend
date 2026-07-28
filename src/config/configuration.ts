@@ -6,6 +6,12 @@ export default () => ({
     origin: process.env.CORS_ORIGIN ?? 'http://localhost:4200',
   },
 
+  // Motor de BD: "turso-sqlite" (adapter PrismaLibSQL) | "postgresql" | "mysql" | "sqlite" (nativo).
+  // Ver prisma.config.ts y src/prisma/prisma.service.ts.
+  database: {
+    provider: process.env.DB_PROVIDER ?? 'turso-sqlite',
+  },
+
   turso: {
     databaseUrl: process.env.TURSO_DATABASE_URL ?? 'http://127.0.0.1:8080',
     authToken: process.env.TURSO_AUTH_TOKEN ?? '',

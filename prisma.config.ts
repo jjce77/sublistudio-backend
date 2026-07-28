@@ -1,22 +1,31 @@
-// Config de la Prisma CLI (validate, migrate, studio) para hablar con Turso vía el mismo
-// adapter PrismaLibSQL que usa src/prisma/prisma.service.ts en runtime (ver adr-sublistudio.md
-// DEC-02). Sin este archivo, la CLI usa el "classic engine", que exige una URL nativa `file:`
-// y rechaza `libsql://...` — ver TASKS.md Fase 0.
+// Motor elegido vía DB_PROVIDER (.env). "turso-sqlite" usa el adapter PrismaLibSQL (Turso no
+// soporta `libsql://` nativo); el resto usa el motor nativo de Prisma con DATABASE_URL.
+// El literal `provider` de schema.prisma se sincroniza con `npm run db:prepare`.
 import 'dotenv/config';
 import { defineConfig } from 'prisma/config';
 import { PrismaLibSQL } from '@prisma/adapter-libsql';
 
-export default defineConfig({
-  experimental: { adapter: true },
-  schema: 'prisma/schema.prisma',
-  migrations: {
-    path: 'prisma/migrations',
-  },
-  engine: 'js',
-  async adapter() {
-    return new PrismaLibSQL({
-      url: process.env.TURSO_DATABASE_URL!,
-      authToken: process.env.TURSO_AUTH_TOKEN,
+const isTursoSqlite = (process.env.DB_PROVIDER ?? 'turso-sqlite') === 'turso-sqlite';
+
+// Dos ramas completas: PrismaConfig discrimina por `engine`, un spread condicional no tipa bien.
+export default isTursoSqlite
+  ? defineConfig({
+      schema: 'prisma/schema.prisma',
+      migrations: {
+        path: 'prisma/migrations',
+      },
+      experimental: { adapter: true },
+      engine: 'js',
+      async adapter() {
+        return new PrismaLibSQL({
+          url: process.env.TURSO_DATABASE_URL!,
+          authToken: process.env.TURSO_AUTH_TOKEN,
+        });
+      },
+    })
+  : defineConfig({
+      schema: 'prisma/schema.prisma',
+      migrations: {
+        path: 'prisma/migrations',
+      },
     });
-  },
-});
