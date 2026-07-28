@@ -3,8 +3,6 @@
 Sublistudio-backend: es backend en nest que soporta una plataforma digital de comercio de imagenes.
 API de la plataforma de membresía SubliStudio. NestJS + Prisma + Turso (libSQL).
 
-Ver `../documentacion-sublistudio/plan-de-trabajo-sublistudio-02.md` (fases) y `../documentacion-sublistudio/adr-sublistudio.md` (decisiones de arquitectura).
-
 ## Requisitos
 
 - Node.js 20+
@@ -20,11 +18,14 @@ cp .env.example .env
 ```
 
 ### Base de datos
-
 ```bash
+# Sincroniza las tablas directamente en la base de datos de Turso
+npx prisma db push
+
+# Genera el cliente de Prisma para el autocompletado en el código
 npx prisma generate
-npx prisma migrate dev --name init
 ```
+revisar: npx prisma migrate dev --name init
 
 ### Levantar servicios (Redis)
 

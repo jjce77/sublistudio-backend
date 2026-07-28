@@ -60,7 +60,7 @@ generator client {
 // PrismaLibSQL (TURSO_DATABASE_URL/TURSO_AUTH_TOKEN), registrado en prisma.config.ts (CLI)
 // y src/prisma/prisma.service.ts (runtime). Ver adr-sublistudio.md DEC-02.
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -159,6 +159,7 @@ model User {
   uploadedResources Resource[]     @relation("ResourceUploadedBy")
   tickets           Ticket[]       @relation("TicketCreatedBy")
   auditLogs         AuditLog[]
+  favorites         Favorite[]
 
   @@unique([provider, providerId], map: "uq_users_provider_provider_code")
   @@index([roleId], map: "idx_users_role_id") // índice: guards filtran por rol constantemente
@@ -266,9 +267,15 @@ model Resource {
   compressedFileType      String? @map("compressed_file_type")
 
   // Thumbnails: generados de forma asíncrona tras la carga (background job), a partir de previewImageKey.
-  // null mientras el job no ha corrido o falló — evita servir la imagen pesada en el catálogo.
-  thumbnailsGeneratedAt DateTime?           @map("thumbnails_generated_at")
-  thumbnails            ResourceThumbnail[]
+  // NO se modelan como tabla — se derivan por convención de nombre de archivo en código, no en BD:
+  //   "<previewImageKey sin extensión>-thumb_<alto>x<ancho>.jpg"
+  // Tamaños fijos definidos por convención de negocio/código (constante compartida, ej.
+  // src/resources/constants/thumbnail-sizes.ts — no en este schema):
+  //   SMALL  = 300 (alto) x 300 (ancho) px — grillas/catálogo de recursos
+  //   MEDIUM = 600 (alto) x 600 (ancho) px — vista de detalle/preview ampliado
+  // thumbnailsGeneratedAt: null mientras el job no ha corrido o falló — evita servir la imagen
+  // pesada en el catálogo antes de que existan los .jpg derivados en storage.
+  thumbnailsGeneratedAt DateTime? @map("thumbnails_generated_at")
 
   // visibility: "FREE" | "PREMIUM" — controla qué se muestra en la landing pública (Fase 5)
   visibility String @default("PREMIUM") @map("visibility")
@@ -276,8 +283,11 @@ model Resource {
   uploadedById Int  @map("uploaded_by_id")
   uploadedBy   User @relation("ResourceUploadedBy", fields: [uploadedById], references: [id])
 
-  categories ResourceCategory[]
-  tickets    Ticket[]           @relation("TicketAboutResource")
+  categories    ResourceCategory[]
+  productTypes  ResourceProductType[]
+  tickets       Ticket[]              @relation("TicketAboutResource")
+  favoritedBy   Favorite[]
+  stats         ResourceStats?
 
   createdAt DateTime  @default(now()) @map("created_at")
   updatedAt DateTime  @updatedAt @map("updated_at")
@@ -288,27 +298,104 @@ model Resource {
   @@map("resources")
 }
 
-// Tamaños generados por convención de negocio/código (ej. SMALL=300px, MEDIUM=800px).
-// Se modela aparte (no como columnas fijas en Resource) para poder agregar un tamaño nuevo
-// sin migrar el schema, y para trackear si la generación async falló o sigue pendiente
-// (ausencia de fila = no generado todavía).
-model ResourceThumbnail {
+// ─────────────────────────────────────────────────────────────
+// Favoritos
+// ─────────────────────────────────────────────────────────────
+
+// Un usuario marca un recurso como favorito — alimenta el listado "Mis favoritos" del dashboard.
+// Entidad propia (no solo contador) porque hay que saber CUÁLES recursos favoritó CADA usuario,
+// no solo cuántos en total (ese conteo vive, ya denormalizado, en ResourceStats.favoritesCount).
+model Favorite {
+  id Int @id @default(autoincrement())
+
+  userId Int  @map("user_id")
+  user   User @relation(fields: [userId], references: [id])
+
+  resourceId Int      @map("resource_id")
+  resource   Resource @relation(fields: [resourceId], references: [id])
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, resourceId], map: "uq_favorites_user_id_resource_id")
+  @@index([userId], map: "idx_favorites_user_id") // dashboard: listado de favoritos por usuario
+  @@index([resourceId], map: "idx_favorites_resource_id")
+  @@map("favorites")
+}
+
+// Contadores denormalizados 1:1 con Resource — evita hacer COUNT(*) sobre favorites y JOIN con
+// audit_logs en cada request de catálogo/detalle (requisito explícito: evitar queries complejos
+// y demorados). La capa de servicio mantiene estos contadores sincronizados en la misma
+// transacción que crea/borra el Favorite, registra un "me gusta" o una descarga — no son
+// columnas generadas por SQL.
+// likesCount: contador simple de "me gusta", incrementado/decrementado directamente por la capa
+// de servicio. No existe una tabla `resource_likes` por usuario (se descartó a propósito: no hay
+// nada desarrollado aún sobre esa función y generaría el mismo tipo de queries/mantenimiento que
+// `favorites` sin necesidad confirmada de saber CUÁL usuario dio like a CUÁL recurso). Si más
+// adelante se necesita ese detalle (ej. deduplicar likes por usuario, o listar "recursos que
+// me gustaron"), reintroducir una tabla `ResourceLike` con el mismo patrón que `Favorite`.
+model ResourceStats {
+  id Int @id @default(autoincrement())
+
+  downloadsCount Int @default(0) @map("downloads_count")
+  likesCount     Int @default(0) @map("likes_count")
+  favoritesCount Int @default(0) @map("favorites_count")
+
+  lastDownloadedAt DateTime? @map("last_downloaded_at")
+  // lastLikedAt: fecha del "me gusta" más reciente. Se actualiza junto con likesCount, sin
+  // depender de una tabla resource_likes — útil para ordenar por actividad/tendencia reciente.
+  lastLikedAt DateTime? @map("last_liked_at")
+
+  // FK al final, antes de auditoría — Estandar_desarrrollo_bases_datos.md §3.1.
+  resourceId Int      @unique @map("resource_id")
+  resource   Resource @relation(fields: [resourceId], references: [id])
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("resource_stats")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tipos de producto (ej. t-shirt, mug, cojín) — catálogo independiente de Category
+// ─────────────────────────────────────────────────────────────
+
+// Mismo patrón que Category: un recurso puede ilustrar varios tipos de producto físico
+// (ej. un mismo diseño navideño usado en taza Y camiseta), y esta clasificación es ortogonal
+// a la temática/categoría del recurso (navidad, verano, día de la madre...).
+model ProductType {
+  id Int @id @default(autoincrement())
+
+  name String @unique @map("product_type") // campo descriptivo principal, nombrado como la tabla (singular)
+  slug String @unique @map("product_type_code")
+
+  resources ResourceProductType[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at") // soft delete — evita romper el historial de recursos ya clasificados
+
+  @@map("product_types")
+}
+
+// Tabla pivote N:M explícita, mismo patrón que ResourceCategory. Nombre en BD ordenado
+// alfabéticamente por tabla ("product_types" antes que "resources"), según el estándar.
+model ResourceProductType {
   id Int @id @default(autoincrement())
 
   resourceId Int      @map("resource_id")
   resource   Resource @relation(fields: [resourceId], references: [id])
 
-  size       String @map("size") // "SMALL" | "MEDIUM" (agregar más valores si se necesita, sin migrar schema)
-  storageKey String @map("storage_key")
-  width      Int?   @map("width_px")
-  height     Int?   @map("height_px")
+  productTypeId Int         @map("product_type_id")
+  productType   ProductType @relation(fields: [productTypeId], references: [id])
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  @@unique([resourceId, size], map: "uq_resource_thumbnails_resource_id_size")
-  @@index([resourceId], map: "idx_resource_thumbnails_resource_id")
-  @@map("resource_thumbnails")
+  @@unique([resourceId, productTypeId], map: "uq_product_types_resources_resource_id_product_type_id")
+  @@index([productTypeId], map: "idx_product_types_resources_product_type_id") // índice: catálogo filtra por tipo de producto
+  @@index([resourceId], map: "idx_product_types_resources_resource_id")
+  @@map("product_types_resources")
 }
 
 // Tabla pivote N:M explícita. Nombre en BD ordenado alfabéticamente por tabla ("categories" antes
