@@ -12,6 +12,7 @@ import { ROLE_SLUGS } from '../common/constants/role.constant';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { OAuthProfile } from './oauth/oauth-profile.type';
 import { JwtPayload } from './types/jwt-payload.type';
 
 // Hash bcrypt "señuelo" (de una contraseña aleatoria descartada, no de una cuenta real) contra
@@ -173,6 +174,142 @@ export class AuthService {
       },
       tokens,
     };
+  }
+
+  // Punto de entrada único para CUALQUIER proveedor OAuth2 — solo conoce OAuthProfile (forma
+  // normalizada), nunca el payload específico de Google/Facebook/etc. (ver adr-sublistudio.md
+  // DEC-05, "Arquitectura de proveedores OAuth2"). Llamado desde el callback de cada proveedor
+  // vía OAuthProviderEnabledGuard + AuthGuard(providerName).
+  async loginWithOAuth(profile: OAuthProfile): Promise<AuthResult> {
+    const existingByProvider = await this.prisma.user.findUnique({
+      where: {
+        provider_providerId: {
+          provider: profile.provider,
+          providerId: profile.providerId,
+        },
+      },
+      include: { role: true },
+    });
+
+    const user = existingByProvider
+      ? await this.reactivateOAuthUser(existingByProvider.id)
+      : await this.linkOrCreateOAuthUser(profile);
+
+    if (user.isBlocked) {
+      throw new ForbiddenException(
+        'Tu cuenta está bloqueada. Contacta a soporte.',
+      );
+    }
+
+    const tokens = await this.issueTokens({
+      sub: user.id,
+      roleSlug: user.role.slug,
+    });
+
+    return {
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.fullName,
+        roleSlug: user.role.slug,
+      },
+      tokens,
+    };
+  }
+
+  private async reactivateOAuthUser(userId: number) {
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: { lastLoginAt: new Date() },
+      include: { role: true },
+    });
+  }
+
+  // Si ya existe una cuenta local con ese email, se vincula el proveedor a esa cuenta
+  // (authMethod pasa a "both") en vez de crear un duplicado. Si no existe, se crea una cuenta
+  // 100% OAuth (passwordHash null, authMethod = nombre del proveedor).
+  private async linkOrCreateOAuthUser(profile: OAuthProfile) {
+    const existingByEmail = await this.prisma.user.findUnique({
+      where: { email: profile.email },
+      include: { role: true },
+    });
+
+    if (existingByEmail) {
+      return this.prisma.$transaction(async (tx) => {
+        const updated = await tx.user.update({
+          where: { id: existingByEmail.id },
+          data: {
+            provider: profile.provider,
+            providerId: profile.providerId,
+            authMethod: existingByEmail.passwordHash
+              ? 'both'
+              : profile.provider,
+            avatarUrl: existingByEmail.avatarUrl ?? profile.avatarUrl,
+            emailVerifiedAt: existingByEmail.emailVerifiedAt ?? new Date(),
+            lastLoginAt: new Date(),
+          },
+          include: { role: true },
+        });
+
+        await this.auditService.record(
+          {
+            module: 'auth',
+            action: 'UPDATE',
+            entityType: 'User',
+            entityId: updated.id,
+            userId: updated.id,
+            payload: { linkedProvider: profile.provider },
+          },
+          tx,
+        );
+
+        return updated;
+      });
+    }
+
+    const defaultRole = await this.prisma.role.findUnique({
+      where: { slug: ROLE_SLUGS.USUARIO },
+    });
+    if (!defaultRole) {
+      throw new Error(
+        `Rol por defecto "${ROLE_SLUGS.USUARIO}" no existe en la base de datos. Corre "npm run db:seed".`,
+      );
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const created = await tx.user.create({
+        data: {
+          email: profile.email,
+          passwordHash: null,
+          authMethod: profile.provider,
+          provider: profile.provider,
+          providerId: profile.providerId,
+          firstName: profile.firstName,
+          lastName: profile.lastName,
+          fullName: `${profile.firstName} ${profile.lastName}`.trim(),
+          avatarUrl: profile.avatarUrl,
+          // Google (y proveedores OAuth2 en general) ya verificaron el email por su cuenta.
+          emailVerifiedAt: new Date(),
+          lastLoginAt: new Date(),
+          roleId: defaultRole.id,
+        },
+        include: { role: true },
+      });
+
+      await this.auditService.record(
+        {
+          module: 'auth',
+          action: 'CREATE',
+          entityType: 'User',
+          entityId: created.id,
+          userId: created.id,
+          payload: { email: created.email, provider: profile.provider },
+        },
+        tx,
+      );
+
+      return created;
+    });
   }
 
   async refresh(userId: number): Promise<AuthTokens> {

@@ -10,15 +10,20 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { AuthGuard } from '@nestjs/passport';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
+import { CurrentOAuthProfile } from '../common/decorators/current-oauth-profile.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { OAuthProviderName } from '../common/decorators/oauth-provider-name.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { JwtRefreshGuard } from '../common/guards/jwt-refresh.guard';
+import { OAuthProviderEnabledGuard } from '../common/guards/oauth-provider-enabled.guard';
 import { AuthService, type SafeUser } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import type { OAuthProfile } from './oauth/oauth-profile.type';
 import type { JwtPayload } from './types/jwt-payload.type';
 import { REFRESH_TOKEN_COOKIE } from './strategies/jwt-refresh.strategy';
 
@@ -49,6 +54,28 @@ export class AuthController {
     @Res({ passthrough: true }) response: Response,
   ) {
     const { user, tokens } = await this.authService.login(dto);
+    this.setRefreshTokenCookie(response, tokens.refreshToken);
+    return { user, accessToken: tokens.accessToken };
+  }
+
+  // OAuthProviderEnabledGuard corre ANTES que AuthGuard('google') — si el proveedor no existe
+  // en el catálogo o no está habilitado por un admin, responde 404 sin llegar a iniciar el
+  // handshake de Google (ver adr-sublistudio.md DEC-05).
+  @Get('google')
+  @OAuthProviderName('google')
+  @UseGuards(OAuthProviderEnabledGuard, AuthGuard('google'))
+  googleAuth(): void {
+    // Nunca se ejecuta: Passport intercepta la request y redirige a Google antes de llegar aquí.
+  }
+
+  @Get('google/callback')
+  @OAuthProviderName('google')
+  @UseGuards(OAuthProviderEnabledGuard, AuthGuard('google'))
+  async googleCallback(
+    @CurrentOAuthProfile() profile: OAuthProfile,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const { user, tokens } = await this.authService.loginWithOAuth(profile);
     this.setRefreshTokenCookie(response, tokens.refreshToken);
     return { user, accessToken: tokens.accessToken };
   }

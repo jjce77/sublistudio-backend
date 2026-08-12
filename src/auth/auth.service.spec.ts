@@ -31,9 +31,11 @@ describe('AuthService', () => {
   let auditService: { record: jest.Mock };
   let authService: AuthService;
   let txUserCreate: jest.Mock;
+  let txUserUpdate: jest.Mock;
 
   beforeEach(() => {
     txUserCreate = jest.fn();
+    txUserUpdate = jest.fn();
     prisma = {
       user: {
         findUnique: jest.fn(),
@@ -41,7 +43,7 @@ describe('AuthService', () => {
       },
       role: { findUnique: jest.fn() },
       $transaction: jest.fn((callback: (tx: unknown) => unknown) =>
-        callback({ user: { create: txUserCreate } }),
+        callback({ user: { create: txUserCreate, update: txUserUpdate } }),
       ),
     };
     jwtService = { signAsync: jest.fn().mockResolvedValue('signed-token') };
@@ -216,6 +218,138 @@ describe('AuthService', () => {
 
       await expect(authService.refresh(1)).rejects.toBeInstanceOf(
         UnauthorizedException,
+      );
+    });
+  });
+
+  describe('loginWithOAuth', () => {
+    const profile = {
+      provider: 'google',
+      providerId: 'google-sub-123',
+      email: 'ana@example.com',
+      firstName: 'Ana',
+      lastName: 'García',
+      avatarUrl: 'https://example.com/avatar.jpg',
+    };
+
+    it('reactiva (actualiza lastLoginAt) a un usuario ya vinculado a ese provider+providerId', async () => {
+      prisma.user.findUnique.mockResolvedValueOnce({
+        id: 1,
+        email: profile.email,
+        fullName: 'Ana García',
+        isBlocked: false,
+        role: { slug: ROLE_SLUGS.CLIENTE },
+      });
+      prisma.user.update.mockResolvedValue({
+        id: 1,
+        email: profile.email,
+        fullName: 'Ana García',
+        isBlocked: false,
+        role: { slug: ROLE_SLUGS.CLIENTE },
+      });
+
+      const result = await authService.loginWithOAuth(profile);
+
+      expect(prisma.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            provider_providerId: {
+              provider: 'google',
+              providerId: 'google-sub-123',
+            },
+          },
+        }),
+      );
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 1 } }),
+      );
+      expect(result.tokens.accessToken).toBe('signed-token');
+    });
+
+    it('vincula el proveedor a una cuenta local existente con el mismo email (authMethod: both)', async () => {
+      prisma.user.findUnique
+        .mockResolvedValueOnce(null) // no existe por provider+providerId
+        .mockResolvedValueOnce({
+          id: 2,
+          email: profile.email,
+          passwordHash: 'hash-existente',
+          avatarUrl: null,
+          emailVerifiedAt: null,
+        }); // sí existe por email (cuenta local)
+      txUserUpdate.mockResolvedValue({
+        id: 2,
+        email: profile.email,
+        fullName: 'Ana García',
+        isBlocked: false,
+        role: { slug: ROLE_SLUGS.CLIENTE },
+      });
+
+      const result = await authService.loginWithOAuth(profile);
+
+      expect(txUserUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 2 },
+          data: expect.objectContaining({ authMethod: 'both' }) as unknown,
+        }),
+      );
+      expect(auditService.record).toHaveBeenCalledWith(
+        expect.objectContaining({ module: 'auth', action: 'UPDATE' }),
+        expect.anything(),
+      );
+      expect(result.tokens.accessToken).toBe('signed-token');
+    });
+
+    it('crea una cuenta 100% OAuth nueva si no existe ni por provider+providerId ni por email', async () => {
+      prisma.user.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null);
+      prisma.role.findUnique.mockResolvedValue({
+        id: 4,
+        slug: ROLE_SLUGS.USUARIO,
+      });
+      txUserCreate.mockResolvedValue({
+        id: 3,
+        email: profile.email,
+        fullName: 'Ana García',
+        isBlocked: false,
+        role: { slug: ROLE_SLUGS.USUARIO },
+      });
+
+      const result = await authService.loginWithOAuth(profile);
+
+      expect(txUserCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            passwordHash: null,
+            authMethod: 'google',
+            provider: 'google',
+            providerId: 'google-sub-123',
+          }) as unknown,
+        }),
+      );
+      expect(auditService.record).toHaveBeenCalledWith(
+        expect.objectContaining({ module: 'auth', action: 'CREATE' }),
+        expect.anything(),
+      );
+      expect(result.user.roleSlug).toBe(ROLE_SLUGS.USUARIO);
+    });
+
+    it('rechaza (403) una cuenta bloqueada aunque el proveedor OAuth ya esté vinculado', async () => {
+      prisma.user.findUnique.mockResolvedValueOnce({
+        id: 1,
+        email: profile.email,
+        isBlocked: true,
+        role: { slug: ROLE_SLUGS.CLIENTE },
+      });
+      prisma.user.update.mockResolvedValue({
+        id: 1,
+        email: profile.email,
+        isBlocked: true,
+        role: { slug: ROLE_SLUGS.CLIENTE },
+      });
+
+      await expect(authService.loginWithOAuth(profile)).rejects.toBeInstanceOf(
+        ForbiddenException,
       );
     });
   });
