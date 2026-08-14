@@ -19,7 +19,7 @@ import { JwtRefreshStrategy } from './strategies/jwt-refresh.strategy';
     AuthService,
     JwtAccessStrategy,
     JwtRefreshStrategy,
-    // Arquitectura OAuth2 (adr-sublistudio.md DEC-05): agregar un proveedor nuevo significa
+    // Arquitectura OAuth2: agregar un proveedor nuevo significa
     // crear su <Nombre>Strategy (handshake + normalización juntos), agregarla aquí, y sumar su
     // nombre al arreglo de OAuthService — nada más de este módulo cambia.
     GoogleStrategy,
