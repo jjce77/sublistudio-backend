@@ -8,14 +8,20 @@ describe('OAuthService', () => {
   });
 
   it('lista solo los proveedores registrados en el arreglo del catálogo', () => {
-    expect(service.listAvailableProviders()).toEqual(['google']);
+    expect(service.listAvailableProviders()).toEqual([
+      'google',
+      'facebook',
+      'linkedin',
+    ]);
   });
 
   it('confirma que un proveedor registrado existe', () => {
     expect(service.findProvider('google')).toBe(true);
+    expect(service.findProvider('facebook')).toBe(true);
+    expect(service.findProvider('linkedin')).toBe(true);
   });
 
   it('devuelve false para un proveedor no registrado, aunque "suene" real', () => {
-    expect(service.findProvider('facebook')).toBe(false);
+    expect(service.findProvider('twitter')).toBe(false);
   });
 });

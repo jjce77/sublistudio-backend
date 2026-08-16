@@ -13,7 +13,7 @@ import { Injectable } from '@nestjs/common';
 // de este archivo cambia.
 @Injectable()
 export class OAuthService {
-  private readonly providers: string[] = ['google'];
+  private readonly providers: string[] = ['google', 'facebook', 'linkedin'];
 
   listAvailableProviders(): string[] {
     return [...this.providers];
