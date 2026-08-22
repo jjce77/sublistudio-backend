@@ -21,8 +21,11 @@ import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { JwtRefreshGuard } from '../common/guards/jwt-refresh.guard';
 import { OAuthProviderEnabledGuard } from '../common/guards/oauth-provider-enabled.guard';
 import { AuthService, type SafeUser } from './auth.service';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
+import { VerifyOtpDto } from './dto/verify-otp.dto';
 import type { OAuthProfile } from './oauth/oauth-profile.type';
 import type { JwtPayload } from './types/jwt-payload.type';
 import { REFRESH_TOKEN_COOKIE } from './strategies/jwt-refresh.strategy';
@@ -113,6 +116,48 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   me(@CurrentUser() user: SafeUser): Promise<SafeUser> {
     return this.authService.getSafeUserById(user.id);
+  }
+
+  // No requiere sesión — es justamente para quien la perdió. Mismo criterio de throttling que
+  // login (endpoint sensible a fuerza bruta/enumeración — CLAUDE.md).
+  @Post('forgot-password')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  forgotPassword(
+    @Body() dto: ForgotPasswordDto,
+  ): Promise<{ message: string }> {
+    return this.authService.forgotPassword(dto);
+  }
+
+  @Post('reset-password')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  resetPassword(@Body() dto: ResetPasswordDto): Promise<{ message: string }> {
+    return this.authService.resetPassword(dto);
+  }
+
+  // Email OTP: requiere sesión (el usuario ya inició sesión y está verificando SU propio email;
+  // no es un paso previo al login). El límite es más ajustado que otp/verify porque cada envío
+  // dispara un correo real.
+  @Post('otp/send')
+  @HttpCode(HttpStatus.OK)
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: 3, ttl: 60_000 } })
+  sendOtp(@CurrentUser() user: SafeUser): Promise<{ message: string }> {
+    return this.authService.sendEmailOtp(user.id);
+  }
+
+  @Post('otp/verify')
+  @HttpCode(HttpStatus.OK)
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  verifyOtp(
+    @CurrentUser() user: SafeUser,
+    @Body() dto: VerifyOtpDto,
+  ): Promise<{ message: string }> {
+    return this.authService.verifyEmailOtp(user.id, dto);
   }
 
   // DEC-03: refresh token en cookie httpOnly + Secure + SameSite=None (frontend y backend en

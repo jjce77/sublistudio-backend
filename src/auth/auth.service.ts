@@ -7,11 +7,21 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
+import {
+  createHash,
+  randomBytes,
+  randomInt,
+  timingSafeEqual,
+} from 'crypto';
 import { AuditService } from '../audit/audit.service';
 import { ROLE_SLUGS } from '../common/constants/role.constant';
+import { MailerService } from '../mailer/mailer.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
+import { VerifyOtpDto } from './dto/verify-otp.dto';
 import { OAuthProfile } from './oauth/oauth-profile.type';
 import { JwtPayload } from './types/jwt-payload.type';
 
@@ -21,6 +31,15 @@ import { JwtPayload } from './types/jwt-payload.type';
 // delatando por timing lo que el mensaje genérico ya intenta ocultar (DEC-05).
 const DUMMY_PASSWORD_HASH =
   '$2a$10$CwTycUXWue0Thq9StjUM0uJ8Yv0lqzz6b5PZ2mSAvdxeqYzR6qYb2';
+
+// Recuperación de contraseña (DEC-05): el token vive 30 minutos.
+const RESET_TOKEN_TTL_MS = 30 * 60 * 1000;
+// Email OTP: código de 6 dígitos vigente 10 minutos.
+const OTP_TTL_MS = 10 * 60 * 1000;
+const GENERIC_FORGOT_PASSWORD_RESPONSE = {
+  message:
+    'Si el email existe, recibirás instrucciones para restablecer tu contraseña.',
+};
 
 export interface AuthTokens {
   accessToken: string;
@@ -46,6 +65,7 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly auditService: AuditService,
+    private readonly mailerService: MailerService,
   ) {}
 
   // NOTA de alcance: hoy no existe un flujo de registro público definido en TASKS.md (Fase 2
@@ -326,6 +346,215 @@ export class AuthService {
     // robado. NOTA de alcance: sin un almacén de tokens emitidos/revocados todavía, esto NO
     // invalida el token anterior — solo emite uno nuevo. Ver limitación en README del módulo.
     return this.issueTokens({ sub: user.id, roleSlug: user.role.slug });
+  }
+
+  // DEC-05: la respuesta HTTP es idéntica exista o no el email, y también si la cuenta es 100%
+  // OAuth — la diferencia entre esos 3 casos se refleja SOLO en qué correo se envía (o si se
+  // envía alguno), nunca en lo que recibe quien llama a este endpoint. A diferencia de login()
+  // no se busca aquí igualar el tiempo de respuesta con un trabajo "señuelo": el costo de este
+  // flujo lo domina el envío del correo (fire-and-forget), no una comparación criptográfica.
+  async forgotPassword(
+    dto: ForgotPasswordDto,
+  ): Promise<{ message: string }> {
+    const user = await this.prisma.user.findUnique({
+      where: { email: dto.email },
+    });
+
+    if (!user || user.deletedAt) {
+      return GENERIC_FORGOT_PASSWORD_RESPONSE;
+    }
+
+    if (!user.passwordHash) {
+      // Cuenta 100% OAuth: no hay contraseña que restablecer, así que NUNCA se genera token acá
+      // — solo se informa por correo, sin filtrar ese detalle en la respuesta HTTP.
+      await this.mailerService.sendMail({
+        to: user.email,
+        subject: 'Recuperación de contraseña',
+        text: `Tu cuenta de SubliStudio inicia sesión con ${user.provider ?? 'un proveedor externo'}. No tiene una contraseña que restablecer — inicia sesión con ese método.`,
+      });
+      return GENERIC_FORGOT_PASSWORD_RESPONSE;
+    }
+
+    const { token, hash } = this.buildResetToken(user.id);
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        resetPasswordTokenHash: hash,
+        resetPasswordTokenExpiresAt: new Date(Date.now() + RESET_TOKEN_TTL_MS),
+      },
+    });
+
+    await this.mailerService.sendMail({
+      to: user.email,
+      subject: 'Recuperación de contraseña',
+      text: `Usa este token para restablecer tu contraseña (expira en 30 minutos): ${token}`,
+    });
+
+    return GENERIC_FORGOT_PASSWORD_RESPONSE;
+  }
+
+  async resetPassword(dto: ResetPasswordDto): Promise<{ message: string }> {
+    const parsed = this.parseResetToken(dto.token);
+    const user = parsed
+      ? await this.prisma.user.findUnique({ where: { id: parsed.userId } })
+      : null;
+
+    const isValid =
+      parsed !== null &&
+      user !== null &&
+      user.deletedAt === null &&
+      this.isFreshToken(
+        user.resetPasswordTokenHash,
+        user.resetPasswordTokenExpiresAt,
+        this.hashResetSecret(parsed.secret),
+      );
+
+    if (!isValid || !user) {
+      throw new UnauthorizedException('Token inválido o expirado.');
+    }
+
+    const passwordHash = await bcrypt.hash(dto.newPassword, 10);
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: user.id },
+        data: {
+          passwordHash,
+          // Token de un solo uso: se invalida apenas se consume, exitosamente o no volvería a
+          // intentarse con el mismo — evita reutilización si el correo quedó expuesto.
+          resetPasswordTokenHash: null,
+          resetPasswordTokenExpiresAt: null,
+        },
+      });
+
+      await this.auditService.record(
+        {
+          module: 'auth',
+          action: 'UPDATE',
+          entityType: 'User',
+          entityId: user.id,
+          userId: user.id,
+          payload: { passwordReset: true },
+        },
+        tx,
+      );
+    });
+
+    return { message: 'Contraseña actualizada correctamente.' };
+  }
+
+  // Email OTP — hoy cubre verificación de email (no 2FA en cada login, que es un cambio de
+  // comportamiento del flujo de login en sí y queda fuera de este alcance; ver TASKS.md).
+  async sendEmailOtp(userId: number): Promise<{ message: string }> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user || user.deletedAt) {
+      throw new UnauthorizedException('Sesión inválida.');
+    }
+    if (user.emailVerifiedAt) {
+      return { message: 'Tu email ya está verificado.' };
+    }
+
+    const code = String(randomInt(100000, 1000000));
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: { otpCode: code, otpExpiresAt: new Date(Date.now() + OTP_TTL_MS) },
+    });
+
+    await this.mailerService.sendMail({
+      to: user.email,
+      subject: 'Código de verificación de SubliStudio',
+      text: `Tu código de verificación es ${code}. Expira en 10 minutos.`,
+    });
+
+    return { message: 'Código enviado a tu correo.' };
+  }
+
+  async verifyEmailOtp(
+    userId: number,
+    dto: VerifyOtpDto,
+  ): Promise<{ message: string }> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+
+    const isValid =
+      user !== null &&
+      user.deletedAt === null &&
+      user.otpCode !== null &&
+      user.otpExpiresAt !== null &&
+      user.otpExpiresAt.getTime() > Date.now() &&
+      user.otpCode === dto.code;
+
+    if (!isValid || !user) {
+      throw new UnauthorizedException('Código inválido o expirado.');
+    }
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        emailVerifiedAt: new Date(),
+        otpVerifiedAt: new Date(),
+        otpCode: null,
+        otpExpiresAt: null,
+      },
+    });
+
+    return { message: 'Email verificado correctamente.' };
+  }
+
+  // Token = base64url("<userId>:<secret>"). Codificar el userId en el propio token permite
+  // buscar al usuario por su PK (indexada) en vez de escanear la tabla completa buscando un
+  // resetPasswordTokenHash que coincida — importante en Turso, que cuenta filas escaneadas
+  // contra la cuota del free tier (ver adr-sublistudio.md DEC-02). El secreto (la parte
+  // impredecible) nunca se guarda tal cual — solo su hash, igual que una contraseña.
+  private buildResetToken(userId: number): { token: string; hash: string } {
+    const secret = randomBytes(32).toString('hex');
+    const token = Buffer.from(`${userId}:${secret}`).toString('base64url');
+    return { token, hash: this.hashResetSecret(secret) };
+  }
+
+  private parseResetToken(
+    token: string,
+  ): { userId: number; secret: string } | null {
+    try {
+      const [userIdRaw, secret] = Buffer.from(token, 'base64url')
+        .toString('utf8')
+        .split(':');
+      const userId = Number(userIdRaw);
+      if (!Number.isInteger(userId) || !secret) {
+        return null;
+      }
+      return { userId, secret };
+    } catch {
+      return null;
+    }
+  }
+
+  private hashResetSecret(secret: string): string {
+    return createHash('sha256').update(secret).digest('hex');
+  }
+
+  // Compara en tiempo constante (evita que un atacante infiera el hash correcto byte a byte por
+  // timing) y valida vigencia. `storedHash`/`storedExpiresAt` vienen tal cual de la fila del
+  // usuario — null en cualquiera de los dos significa "no hay token pendiente".
+  private isFreshToken(
+    storedHash: string | null,
+    storedExpiresAt: Date | null,
+    candidateHash: string,
+  ): boolean {
+    if (!storedHash || !storedExpiresAt) {
+      return false;
+    }
+    if (storedExpiresAt.getTime() <= Date.now()) {
+      return false;
+    }
+
+    const storedBuffer = Buffer.from(storedHash, 'hex');
+    const candidateBuffer = Buffer.from(candidateHash, 'hex');
+    if (storedBuffer.length !== candidateBuffer.length) {
+      return false;
+    }
+    return timingSafeEqual(storedBuffer, candidateBuffer);
   }
 
   async getSafeUserById(userId: number): Promise<SafeUser> {

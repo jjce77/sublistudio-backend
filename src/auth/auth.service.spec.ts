@@ -29,6 +29,7 @@ describe('AuthService', () => {
   let jwtService: { signAsync: jest.Mock };
   let configService: { get: jest.Mock; getOrThrow: jest.Mock };
   let auditService: { record: jest.Mock };
+  let mailerService: { sendMail: jest.Mock };
   let authService: AuthService;
   let txUserCreate: jest.Mock;
   let txUserUpdate: jest.Mock;
@@ -52,12 +53,14 @@ describe('AuthService', () => {
       getOrThrow: jest.fn((key: string) => CONFIG_VALUES[key]),
     };
     auditService = { record: jest.fn().mockResolvedValue(undefined) };
+    mailerService = { sendMail: jest.fn().mockResolvedValue(undefined) };
 
     authService = new AuthService(
       prisma as never,
       jwtService as never,
       configService as never,
       auditService as never,
+      mailerService as never,
     );
   });
 
@@ -351,6 +354,255 @@ describe('AuthService', () => {
       await expect(authService.loginWithOAuth(profile)).rejects.toBeInstanceOf(
         ForbiddenException,
       );
+    });
+  });
+
+  describe('forgotPassword — DEC-05 (respuesta idéntica en los 3 casos)', () => {
+    it('responde con el mensaje genérico y no envía correo si el email no existe', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      const result = await authService.forgotPassword({
+        email: 'no-existe@example.com',
+      });
+
+      expect(result.message).toMatch(/Si el email existe/);
+      expect(mailerService.sendMail).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('responde con el mismo mensaje genérico y envía un correo informativo (sin token) si la cuenta es 100% OAuth', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 1,
+        email: 'ana@example.com',
+        passwordHash: null,
+        deletedAt: null,
+        provider: 'google',
+      });
+
+      const result = await authService.forgotPassword({
+        email: 'ana@example.com',
+      });
+
+      expect(result.message).toMatch(/Si el email existe/);
+      expect(mailerService.sendMail).toHaveBeenCalledTimes(1);
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('genera y guarda un token hasheado, y envía el correo con el token, si la cuenta tiene contraseña', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 1,
+        email: 'ana@example.com',
+        passwordHash: 'hash-real',
+        deletedAt: null,
+      });
+
+      const result = await authService.forgotPassword({
+        email: 'ana@example.com',
+      });
+
+      expect(result.message).toMatch(/Si el email existe/);
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 1 },
+          data: expect.objectContaining({
+            resetPasswordTokenHash: expect.any(String) as unknown,
+            resetPasswordTokenExpiresAt: expect.any(Date) as unknown,
+          }) as unknown,
+        }),
+      );
+      expect(mailerService.sendMail).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('resetPassword', () => {
+    // Genera un token real vía forgotPassword (en vez de acceder a los métodos privados de hash)
+    // y extrae lo necesario del correo/llamada mockeados — así la prueba cubre el flujo completo.
+    const buildUserWithToken = async () => {
+      prisma.user.findUnique.mockResolvedValueOnce({
+        id: 5,
+        email: 'ana@example.com',
+        passwordHash: 'hash-viejo',
+        deletedAt: null,
+      });
+      await authService.forgotPassword({ email: 'ana@example.com' });
+
+      const emailText = mailerService.sendMail.mock.calls[0][0].text as string;
+      const token = emailText.split(': ').pop() as string;
+      const updateCall = prisma.user.update.mock.calls[0][0] as {
+        data: {
+          resetPasswordTokenHash: string;
+          resetPasswordTokenExpiresAt: Date;
+        };
+      };
+
+      return {
+        token,
+        storedHash: updateCall.data.resetPasswordTokenHash,
+        storedExpiresAt: updateCall.data.resetPasswordTokenExpiresAt,
+      };
+    };
+
+    it('rechaza un token con formato inválido', async () => {
+      await expect(
+        authService.resetPassword({
+          token: 'no-es-un-token-valido',
+          newPassword: 'ClaveNueva123',
+        }),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('rechaza si el hash no coincide con el guardado en BD', async () => {
+      const { token } = await buildUserWithToken();
+      prisma.user.findUnique.mockReset();
+      prisma.user.findUnique.mockResolvedValue({
+        id: 5,
+        deletedAt: null,
+        resetPasswordTokenHash: 'f'.repeat(64), // 64 hex chars, distinto del real
+        resetPasswordTokenExpiresAt: new Date(Date.now() + 60_000),
+      });
+
+      await expect(
+        authService.resetPassword({ token, newPassword: 'ClaveNueva123' }),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('rechaza un token ya expirado', async () => {
+      const { token, storedHash } = await buildUserWithToken();
+      prisma.user.findUnique.mockReset();
+      prisma.user.findUnique.mockResolvedValue({
+        id: 5,
+        deletedAt: null,
+        resetPasswordTokenHash: storedHash,
+        resetPasswordTokenExpiresAt: new Date(Date.now() - 1000),
+      });
+
+      await expect(
+        authService.resetPassword({ token, newPassword: 'ClaveNueva123' }),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('actualiza la contraseña y consume el token (un solo uso) con un token válido', async () => {
+      const { token, storedHash, storedExpiresAt } =
+        await buildUserWithToken();
+      prisma.user.findUnique.mockReset();
+      prisma.user.findUnique.mockResolvedValue({
+        id: 5,
+        deletedAt: null,
+        resetPasswordTokenHash: storedHash,
+        resetPasswordTokenExpiresAt: storedExpiresAt,
+      });
+
+      const result = await authService.resetPassword({
+        token,
+        newPassword: 'ClaveNueva123',
+      });
+
+      expect(result.message).toMatch(/actualizada/);
+      expect(txUserUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 5 },
+          data: expect.objectContaining({
+            resetPasswordTokenHash: null,
+            resetPasswordTokenExpiresAt: null,
+          }) as unknown,
+        }),
+      );
+      expect(auditService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          module: 'auth',
+          action: 'UPDATE',
+          payload: { passwordReset: true },
+        }),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('sendEmailOtp / verifyEmailOtp', () => {
+    it('sendEmailOtp genera un código de 6 dígitos, lo guarda y envía un correo', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 7,
+        email: 'ana@example.com',
+        deletedAt: null,
+        emailVerifiedAt: null,
+      });
+
+      const result = await authService.sendEmailOtp(7);
+
+      expect(result.message).toMatch(/enviado/);
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 7 },
+          data: expect.objectContaining({
+            otpCode: expect.stringMatching(/^\d{6}$/) as unknown,
+            otpExpiresAt: expect.any(Date) as unknown,
+          }) as unknown,
+        }),
+      );
+      expect(mailerService.sendMail).toHaveBeenCalledTimes(1);
+    });
+
+    it('sendEmailOtp no reenvía nada si el email ya está verificado', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 7,
+        email: 'ana@example.com',
+        deletedAt: null,
+        emailVerifiedAt: new Date(),
+      });
+
+      const result = await authService.sendEmailOtp(7);
+
+      expect(result.message).toMatch(/ya está verificado/);
+      expect(mailerService.sendMail).not.toHaveBeenCalled();
+    });
+
+    it('verifyEmailOtp marca el email como verificado con un código correcto y vigente', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 7,
+        deletedAt: null,
+        otpCode: '123456',
+        otpExpiresAt: new Date(Date.now() + 60_000),
+      });
+
+      const result = await authService.verifyEmailOtp(7, { code: '123456' });
+
+      expect(result.message).toMatch(/verificado/);
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 7 },
+          data: expect.objectContaining({
+            emailVerifiedAt: expect.any(Date) as unknown,
+            otpCode: null,
+            otpExpiresAt: null,
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('verifyEmailOtp rechaza un código incorrecto', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 7,
+        deletedAt: null,
+        otpCode: '123456',
+        otpExpiresAt: new Date(Date.now() + 60_000),
+      });
+
+      await expect(
+        authService.verifyEmailOtp(7, { code: '000000' }),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('verifyEmailOtp rechaza un código ya expirado', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 7,
+        deletedAt: null,
+        otpCode: '123456',
+        otpExpiresAt: new Date(Date.now() - 1000),
+      });
+
+      await expect(
+        authService.verifyEmailOtp(7, { code: '123456' }),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
     });
   });
 });

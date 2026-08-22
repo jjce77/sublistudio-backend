@@ -48,6 +48,13 @@ export default () => {
       localPath: process.env.STORAGE_LOCAL_PATH ?? './storage',
     },
 
+    // Correo saliente — mismo patrón que storage: driver "console" (default) loguea en vez de
+    // enviar de verdad, hasta que se elija un proveedor real (Resend, SES, SMTP...).
+    mailer: {
+      driver: process.env.MAILER_DRIVER ?? 'console',
+      from: process.env.MAILER_FROM ?? 'no-reply@sublistudio.local',
+    },
+
     // OAuth2 — Tener credenciales configuradas NO habilita el proveedor por sí solo: la activación real
     // la decide un admin y se guarda en Variables Globales (OAuthProviderConfigService).
     // callbackUrl se arma solo desde apiBaseUrl + una ruta fija por convención
@@ -65,6 +72,24 @@ export default () => {
           process.env.GOOGLE_OAUTH_CLIENT_SECRET ??
           'changeme-google-client-secret',
         callbackUrl: `${apiBaseUrl}/auth/google/callback`,
+      },
+      facebook: {
+        clientId:
+          process.env.FACEBOOK_OAUTH_CLIENT_ID ??
+          'changeme-facebook-client-id',
+        clientSecret:
+          process.env.FACEBOOK_OAUTH_CLIENT_SECRET ??
+          'changeme-facebook-client-secret',
+        callbackUrl: `${apiBaseUrl}/auth/facebook/callback`,
+      },
+      linkedin: {
+        clientId:
+          process.env.LINKEDIN_OAUTH_CLIENT_ID ??
+          'changeme-linkedin-client-id',
+        clientSecret:
+          process.env.LINKEDIN_OAUTH_CLIENT_SECRET ??
+          'changeme-linkedin-client-secret',
+        callbackUrl: `${apiBaseUrl}/auth/linkedin/callback`,
       },
     },
   };
