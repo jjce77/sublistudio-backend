@@ -1,8 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
-import { Profile, Strategy, VerifyCallback } from 'passport-facebook';
+import { Profile, Strategy } from 'passport-facebook';
 import { OAuthProfile } from '../oauth/oauth-profile.type';
+
+// @types/passport-facebook no exporta un tipo "VerifyCallback" propio (a diferencia de
+// passport-google-oauth20) — se define aquí con la misma firma que su VerifyFunction interna.
+type FacebookVerifyCallback = (error: any, user?: any, info?: any) => void;
 
 // Handshake de Passport con Facebook y normalización del perfil en un solo lugar — mismo
 // patrón que GoogleStrategy (ver el comentario ahí). Para activarla de verdad: agregar
@@ -28,7 +32,7 @@ export class FacebookStrategy extends PassportStrategy(Strategy, 'facebook') {
     _accessToken: string,
     _refreshToken: string,
     profile: Profile,
-    done: VerifyCallback,
+    done: FacebookVerifyCallback,
   ): void {
     try {
       done(null, this.normalizeProfile(profile));
