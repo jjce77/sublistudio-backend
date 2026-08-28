@@ -10,6 +10,7 @@ import configuration from './config/configuration';
 import { GlobalVariablesModule } from './global-variables/global-variables.module';
 import { HealthModule } from './health/health.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { UsersModule } from './users/users.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { PrismaModule } from './prisma/prisma.module';
     AuditModule,
     GlobalVariablesModule,
     AuthModule,
+    UsersModule,
     HealthModule,
   ],
   controllers: [AppController],
