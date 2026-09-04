@@ -58,3 +58,4 @@ Fase 9: se decide el proveedor cloud definitivo (ver ADR DEC-04) y se migra detr
 | `npm run test` | Tests unitarios |
 | `npm run test:e2e` | Tests end-to-end |
 
+
