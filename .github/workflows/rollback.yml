@@ -1,12 +1,11 @@
-# Rollback de emergencia en EC2: re-apunta ":latest" en ghcr.io a una versión anterior
-# (identificada por su SHA, sin reconstruir nada) y la despliega. Además de arreglar lo que
-# está corriendo AHORA, corrige ":latest" en el registry — así, si el EC2 se reinicia más
-# adelante, no vuelve a traer por accidente la versión con el bug.
+# Rollback de emergencia en EC2: re-apunta ":latest" en ghcr.io a una versión anterior (sin
+# reconstruir nada) y la despliega. Por default (target_sha vacío) usa ":to-rollback" — la
+# versión que cd-prod.yml guardó automáticamente antes del último deploy, leída del IMAGE_TAG
+# real que estaba en el .env del EC2 (no adivinada del registry). Para volver más de un paso
+# atrás (más allá del último deploy), se puede pasar un SHA específico en target_sha.
 #
 # Usar cuando el smoke test de cd-prod.yml falla, o cuando se detecta un problema después de un
-# deploy (ver sección 6 de CI-CD-STRATEGY.md). El "target_sha" tiene que ser un SHA que ya haya
-# sido promovido a producción alguna vez por cd-prod.yml (ahí queda taggeado como
-# ghcr.io/<owner>/<repo>:<sha>, sin prefijo "qa-").
+# deploy (ver sección 6 de CI-CD-STRATEGY.md).
 #
 # Nota: si el bug involucró una migración de base de datos, este workflow NO la revierte —
 # Prisma no deshace migraciones automáticamente. Evaluar eso a mano antes o después de correr
@@ -17,8 +16,8 @@ on:
   workflow_dispatch:
     inputs:
       target_sha:
-        description: 'SHA de la última versión buena conocida ya promovida a producción, a la que volver'
-        required: true
+        description: 'SHA específico al que volver (dejar vacío para usar ":to-rollback" automáticamente — la versión previa al último deploy)'
+        required: false
 
 jobs:
   repoint-latest:
@@ -26,6 +25,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      resolved_tag: ${{ steps.resolve.outputs.tag }}
     steps:
       - name: Login en GitHub Container Registry
         uses: docker/login-action@v3
@@ -38,11 +39,20 @@ jobs:
         id: image
         run: echo "name=$(echo ghcr.io/${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
+      - name: Resolver a qué tag volver
+        id: resolve
+        run: |
+          TAG="${{ github.event.inputs.target_sha }}"
+          if [ -z "$TAG" ]; then
+            TAG="to-rollback"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Re-apuntar ":latest" a la versión buena
         run: |
           docker buildx imagetools create \
             --tag ${{ steps.image.outputs.name }}:latest \
-            ${{ steps.image.outputs.name }}:${{ github.event.inputs.target_sha }}
+            ${{ steps.image.outputs.name }}:${{ steps.resolve.outputs.tag }}
 
   deploy-ec2:
     needs: repoint-latest
@@ -58,6 +68,8 @@ jobs:
           script: |
             set -e
             cd /opt/sublistudio-backend
+            sed -i '/^IMAGE_TAG=/d' .env
+            echo "IMAGE_TAG=${{ needs.repoint-latest.outputs.resolved_tag }}" >> .env
             set -a
             . ./.env
             set +a
