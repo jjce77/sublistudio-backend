@@ -4,6 +4,12 @@
 # EC2. Cumple el principio "build once, deploy many" de CI-CD-STRATEGY.md: lo que corre en
 # producción es exactamente lo que se probó en QA, byte a byte.
 #
+# Antes de promover, guarda la versión que YA estaba corriendo en producción bajo el tag
+# ":to-rollback" — leyendo el IMAGE_TAG real desde el .env del EC2 (no ":latest" del registry,
+# que podría estar desincronizado de lo que realmente corre ahí, si algo lo pisó sin pasar por
+# este workflow). Así rollback.yml siempre tiene un punto de retorno confiable, sin depender de
+# que alguien recuerde o escriba a mano el SHA correcto en medio de un incidente.
+#
 # Se dispara a mano (workflow_dispatch), no en cada push a main — porque el SHA del commit en
 # main casi nunca coincide con el SHA que usó cd-qa.yml para taggear la imagen (un merge
 # commit, squash o rebase le cambian el hash, aunque el contenido sea el mismo). Quien aprueba
@@ -22,11 +28,35 @@ on:
   workflow_dispatch:
     inputs:
       qa_sha:
-        description: 'SHA del commit cuya imagen de qa se va a promover a producción (la que ya se validó ahí)'
+        description: 'commit`s SHA for promote image to prod (previously validated)'
         required: true
 
 jobs:
+  capture-current-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      current_tag: ${{ steps.read.outputs.tag }}
+    steps:
+      - name: Cargar clave SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      # No lee ":latest" del registry — lee el IMAGE_TAG real del .env del EC2, que es la
+      # única fuente de verdad de qué está corriendo ahí en este momento. Si el archivo o la
+      # variable todavía no existen (primer deploy de la vida del proyecto), queda vacío y el
+      # paso de "Guardar como :to-rollback" en el siguiente job se salta sin romper nada.
+      - name: Leer IMAGE_TAG real desde el .env del EC2
+        id: read
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p ${{ secrets.EC2_PORT || 22 }} -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          CURRENT=$(ssh -p ${{ secrets.EC2_PORT || 22 }} ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} \
+            "grep '^IMAGE_TAG=' /opt/sublistudio-backend/.env 2>/dev/null | cut -d= -f2")
+          echo "tag=$CURRENT" >> "$GITHUB_OUTPUT"
+
   promote-image:
+    needs: capture-current-tag
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -39,14 +69,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Nombre de imagen en minúsculas (ghcr.io lo exige)
+      - name: Image name - lowercase (ghcr.io requires it)
         id: image
         run: echo "name=$(echo ghcr.io/${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Guardar la versión actual de producción como ":to-rollback"
+        if: needs.capture-current-tag.outputs.current_tag != ''
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ steps.image.outputs.name }}:to-rollback \
+            ${{ steps.image.outputs.name }}:${{ needs.capture-current-tag.outputs.current_tag }}
 
       # imagetools create solo copia el manifest en el registry — no descarga ni reconstruye
       # ninguna capa. La imagen que termina en :latest y en :<qa_sha> es bit a bit la misma que
       # ya está en :qa-<qa_sha>, la que el equipo probó en QA.
-      - name: Promover imagen de qa a producción (sin reconstruir)
+      - name: Promote image from qa to production (not build).
         run: |
           docker buildx imagetools create \
             --tag ${{ steps.image.outputs.name }}:latest \
@@ -67,6 +104,8 @@ jobs:
           script: |
             set -e
             cd /opt/sublistudio-backend
+            sed -i '/^IMAGE_TAG=/d' .env
+            echo "IMAGE_TAG=${{ github.event.inputs.qa_sha }}" >> .env
             set -a
             . ./.env
             set +a
