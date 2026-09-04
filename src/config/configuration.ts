@@ -49,10 +49,22 @@ export default () => {
     },
 
     // Correo saliente — mismo patrón que storage: driver "console" (default) loguea en vez de
-    // enviar de verdad, hasta que se elija un proveedor real (Resend, SES, SMTP...).
+    // enviar de verdad. "smtp" (ej. Gmail con una contraseña de aplicación) es el primer driver
+    // real, pensado para desarrollo/pruebas — un proveedor transaccional (Resend, SES...) sería
+    // otro driver más adelante, sin tocar MailerService.sendMail ni a quien lo consume.
     mailer: {
       driver: process.env.MAILER_DRIVER ?? 'console',
       from: process.env.MAILER_FROM ?? 'no-reply@sublistudio.local',
+      smtp: {
+        host: process.env.SMTP_HOST ?? '',
+        port: parseInt(process.env.SMTP_PORT ?? '587', 10),
+        // STARTTLS (587) es lo normal; secure:true es para el puerto 465 (SSL directo).
+        secure: (process.env.SMTP_SECURE ?? 'false') === 'true',
+        user: process.env.SMTP_USER ?? '',
+        // Para Gmail: NO es la contraseña de la cuenta — es una "contraseña de aplicación"
+        // (myaccount.google.com/apppasswords), requiere verificación en dos pasos activada.
+        pass: process.env.SMTP_PASS ?? '',
+      },
     },
 
     // OAuth2 — Tener credenciales configuradas NO habilita el proveedor por sí solo: la activación real
@@ -75,8 +87,7 @@ export default () => {
       },
       facebook: {
         clientId:
-          process.env.FACEBOOK_OAUTH_CLIENT_ID ??
-          'changeme-facebook-client-id',
+          process.env.FACEBOOK_OAUTH_CLIENT_ID ?? 'changeme-facebook-client-id',
         clientSecret:
           process.env.FACEBOOK_OAUTH_CLIENT_SECRET ??
           'changeme-facebook-client-secret',
@@ -84,8 +95,7 @@ export default () => {
       },
       linkedin: {
         clientId:
-          process.env.LINKEDIN_OAUTH_CLIENT_ID ??
-          'changeme-linkedin-client-id',
+          process.env.LINKEDIN_OAUTH_CLIENT_ID ?? 'changeme-linkedin-client-id',
         clientSecret:
           process.env.LINKEDIN_OAUTH_CLIENT_SECRET ??
           'changeme-linkedin-client-secret',
