@@ -1,0 +1,30 @@
+# Compose de producción, pensado para correr EN el EC2 — no construye la imagen (eso ya lo
+# hizo GitHub Actions y la subió a ghcr.io), solo la baja y la levanta. `IMAGE_NAME` e
+# `IMAGE_TAG` se pisan desde el .env del servidor (ver instrucciones de despliegue) — los
+# defaults acá son solo placeholders.
+#
+# IMAGE_TAG NO debería quedar en "latest" en un .env real: cd-prod.yml y rollback.yml escriben
+# ahí el SHA exacto que se aprobó, así este compose nunca depende de a qué apunte ":latest" en
+# el registry en el momento del pull (ese tag es mutable — cualquiera con permiso de push podría
+# pisarlo). Fijar por SHA es lo que garantiza que el EC2 siempre corre justo lo que se aprobó.
+services:
+  backend:
+    image: ${IMAGE_NAME:-ghcr.io/OWNER/REPO}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - '${PORT:-3000}:${PORT:-3000}'
+    env_file:
+      - .env
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
