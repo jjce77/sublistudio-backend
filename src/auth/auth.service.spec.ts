@@ -16,6 +16,7 @@ describe('AuthService', () => {
     'jwt.refreshSecret': 'test-refresh-secret',
     'jwt.accessExpiration': '15m',
     'jwt.refreshExpiration': '7d',
+    'cors.origin': 'http://localhost:4200',
   };
 
   let prisma: {
@@ -427,7 +428,8 @@ describe('AuthService', () => {
       await authService.forgotPassword({ email: 'ana@example.com' });
 
       const emailText = mailerService.sendMail.mock.calls[0][0].text as string;
-      const token = emailText.split(': ').pop() as string;
+      const resetUrl = new URL(emailText.split('abrí: ').pop() as string);
+      const token = resetUrl.searchParams.get('token') as string;
       const updateCall = prisma.user.update.mock.calls[0][0] as {
         data: {
           resetPasswordTokenHash: string;
@@ -482,8 +484,7 @@ describe('AuthService', () => {
     });
 
     it('actualiza la contraseña y consume el token (un solo uso) con un token válido', async () => {
-      const { token, storedHash, storedExpiresAt } =
-        await buildUserWithToken();
+      const { token, storedHash, storedExpiresAt } = await buildUserWithToken();
       prisma.user.findUnique.mockReset();
       prisma.user.findUnique.mockResolvedValue({
         id: 5,

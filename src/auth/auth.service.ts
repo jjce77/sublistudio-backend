@@ -7,12 +7,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
-import {
-  createHash,
-  randomBytes,
-  randomInt,
-  timingSafeEqual,
-} from 'crypto';
+import { createHash, randomBytes, randomInt, timingSafeEqual } from 'crypto';
 import { AuditService } from '../audit/audit.service';
 import { ROLE_SLUGS } from '../common/constants/role.constant';
 import { MailerService } from '../mailer/mailer.service';
@@ -353,9 +348,7 @@ export class AuthService {
   // envía alguno), nunca en lo que recibe quien llama a este endpoint. A diferencia de login()
   // no se busca aquí igualar el tiempo de respuesta con un trabajo "señuelo": el costo de este
   // flujo lo domina el envío del correo (fire-and-forget), no una comparación criptográfica.
-  async forgotPassword(
-    dto: ForgotPasswordDto,
-  ): Promise<{ message: string }> {
+  async forgotPassword(dto: ForgotPasswordDto): Promise<{ message: string }> {
     const user = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
@@ -388,7 +381,7 @@ export class AuthService {
     await this.mailerService.sendMail({
       to: user.email,
       subject: 'Recuperación de contraseña',
-      text: `Usa este token para restablecer tu contraseña (expira en 30 minutos): ${token}`,
+      text: `Para restablecer tu contraseña (el link expira en 30 minutos), abrí: ${this.buildFrontendResetLink(token)}`,
     });
 
     return GENERIC_FORGOT_PASSWORD_RESPONSE;
@@ -511,6 +504,18 @@ export class AuthService {
     const secret = randomBytes(32).toString('hex');
     const token = Buffer.from(`${userId}:${secret}`).toString('base64url');
     return { token, hash: this.hashResetSecret(secret) };
+  }
+
+  // El usuario final nunca ve el token pelado — hace clic en un link. Se arma sobre CORS_ORIGIN
+  // (config `cors.origin`) en vez de agregar una variable "FRONTEND_URL" aparte: ese valor YA
+  // es, por definición, el dominio del frontend (es lo que le decimos a CORS que confíe), así
+  // que duplicarlo en dos variables que siempre tendrían que coincidir no suma nada.
+  //
+  // La ruta "/reset-password" es una convención asumida acá del lado del backend — hay que
+  // confirmarla (o ajustarla) contra la ruta real que use sublistudio-frontend en Angular.
+  private buildFrontendResetLink(token: string): string {
+    const frontendOrigin = this.configService.get<string>('cors.origin');
+    return `${frontendOrigin}/reset-password?token=${token}`;
   }
 
   private parseResetToken(
