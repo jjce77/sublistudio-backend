@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+
+jobs:
+  build-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node-Version
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Generar cliente de Prisma
+        run: npm run db:generate
+        env:
+          DB_PROVIDER: sqlite
+          DATABASE_URL: file:./prisma/dev.db
+
+      - name: Run Lint
+        run: npm run lint
+
+      - name: Run Build
+        run: npm run build
+
+      - name: Unit test
+        run: npx jest --coverage
+
+      # Deshabilitado por ahora — "dev" todavía no tiene su propio entorno/base de datos.
+      # Descomentar cuando exista un DATABASE_URL real de dev y quieran correr migraciones
+      # automáticas en cada push.
+      # - name: Ejecutar migraciones (deshabilitado)
+      #   run: npx prisma migrate deploy
+      #   env:
+      #     DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
+
+      - name: SonarQube Cloud Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true

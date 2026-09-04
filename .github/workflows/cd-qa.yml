@@ -1,0 +1,55 @@
+# CD de la rama "qa": en cada push arma la imagen Docker de producción (el mismo Dockerfile
+# que usará main/master), la publica en GitHub Container Registry con el tag ":qa", y dispara
+# el Deploy Hook de Render para que levante esa imagen nueva.
+#
+# Requisitos antes de que esto funcione (ver instrucciones aparte):
+#   1. Secret RENDER_DEPLOY_HOOK_URL con la URL del Deploy Hook del servicio en Render.
+#   2. El servicio en Render debe estar configurado para desplegar la imagen
+#      ghcr.io/<owner>/<repo>:qa (y tener credenciales para leerla si el paquete queda privado).
+name: CD - qa (Render)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [qa]
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login in GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=qa
+            type=sha,prefix=qa-
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Disparar deploy en Render
+        run: |
+          curl -f -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
