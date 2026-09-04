@@ -67,6 +67,11 @@ describe('GoogleStrategy', () => {
       done();
     };
 
-    strategy.validate('token', 'refresh', buildRawProfile({ emails: [] }), verify);
+    strategy.validate(
+      'token',
+      'refresh',
+      buildRawProfile({ emails: [] }),
+      verify,
+    );
   });
 });

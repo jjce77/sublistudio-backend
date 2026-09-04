@@ -2,7 +2,10 @@ import { ApiProperty } from '@nestjs/swagger';
 import { IsString, Matches, MaxLength, MinLength } from 'class-validator';
 
 export class ResetPasswordDto {
-  @ApiProperty({ description: 'Token recibido por correo en el flujo de "olvidé mi contraseña".' })
+  @ApiProperty({
+    description:
+      'Token recibido por correo en el flujo de "olvidé mi contraseña".',
+  })
   @IsString()
   token: string;
 
